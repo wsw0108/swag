@@ -2,7 +2,10 @@ package swag
 
 import (
 	"go/ast"
+	goparser "go/parser"
 	"go/token"
+	"golang.org/x/tools/go/loader"
+	"os"
 	"strings"
 )
 
@@ -68,47 +71,58 @@ func (pkgs *PackagesDefinitions) RangeFiles(handle func(filename string, file *a
 func (pkgs *PackagesDefinitions) ParseTypes() (map[*TypeSpecDef]*Schema, error) {
 	parsedSchemas := make(map[*TypeSpecDef]*Schema)
 	for astFile, info := range pkgs.files {
-		for _, astDeclaration := range astFile.Decls {
-			if generalDeclaration, ok := astDeclaration.(*ast.GenDecl); ok && generalDeclaration.Tok == token.TYPE {
-				for _, astSpec := range generalDeclaration.Specs {
-					if typeSpec, ok := astSpec.(*ast.TypeSpec); ok {
-						typeSpecDef := &TypeSpecDef{
-							PkgPath:  info.PackagePath,
-							File:     astFile,
-							TypeSpec: typeSpec,
-						}
+		pkgs.parseTypesFromFile(astFile, info.PackagePath, parsedSchemas)
+	}
+	return parsedSchemas, nil
+}
 
-						if idt, ok := typeSpec.Type.(*ast.Ident); ok && IsGolangPrimitiveType(idt.Name) {
-							parsedSchemas[typeSpecDef] = &Schema{
-								PkgPath: typeSpecDef.PkgPath,
-								Name:    astFile.Name.Name,
-								Schema:  PrimitiveSchema(TransToValidSchemeType(idt.Name)),
-							}
-						}
+func (pkgs *PackagesDefinitions) parseTypesFromFile(astFile *ast.File, packagePath string, parsedSchemas map[*TypeSpecDef]*Schema) {
+	for _, astDeclaration := range astFile.Decls {
+		if generalDeclaration, ok := astDeclaration.(*ast.GenDecl); ok && generalDeclaration.Tok == token.TYPE {
+			for _, astSpec := range generalDeclaration.Specs {
+				if typeSpec, ok := astSpec.(*ast.TypeSpec); ok {
+					typeSpecDef := &TypeSpecDef{
+						PkgPath:  packagePath,
+						File:     astFile,
+						TypeSpec: typeSpec,
+					}
 
-						if pkgs.uniqueDefinitions == nil {
-							pkgs.uniqueDefinitions = make(map[string]*TypeSpecDef)
+					if idt, ok := typeSpec.Type.(*ast.Ident); ok && IsGolangPrimitiveType(idt.Name) && parsedSchemas != nil {
+						parsedSchemas[typeSpecDef] = &Schema{
+							PkgPath: typeSpecDef.PkgPath,
+							Name:    astFile.Name.Name,
+							Schema:  PrimitiveSchema(TransToValidSchemeType(idt.Name)),
 						}
+					}
 
-						fullName := typeSpecDef.FullName()
-						anotherTypeDef, ok := pkgs.uniqueDefinitions[fullName]
-						if ok {
-							if typeSpecDef.PkgPath == anotherTypeDef.PkgPath {
-								continue
-							} else {
-								delete(pkgs.uniqueDefinitions, fullName)
-							}
+					if pkgs.uniqueDefinitions == nil {
+						pkgs.uniqueDefinitions = make(map[string]*TypeSpecDef)
+					}
+
+					fullName := typeSpecDef.FullName()
+					anotherTypeDef, ok := pkgs.uniqueDefinitions[fullName]
+					if ok {
+						if typeSpecDef.PkgPath == anotherTypeDef.PkgPath {
+							continue
 						} else {
-							pkgs.uniqueDefinitions[fullName] = typeSpecDef
+							delete(pkgs.uniqueDefinitions, fullName)
 						}
+					} else {
+						pkgs.uniqueDefinitions[fullName] = typeSpecDef
+					}
 
+					if pkgs.packages[typeSpecDef.PkgPath] == nil {
+						pkgs.packages[typeSpecDef.PkgPath] = &PackageDefinitions{
+							Name:            astFile.Name.Name,
+							TypeDefinitions: map[string]*TypeSpecDef{typeSpecDef.Name(): typeSpecDef},
+						}
+					} else {
 						pkgs.packages[typeSpecDef.PkgPath].TypeDefinitions[typeSpecDef.Name()] = typeSpecDef
 					}
 				}
 			}
 		}
 	}
-	return parsedSchemas, nil
 }
 
 func (pkgs *PackagesDefinitions) findTypeSpec(pkgPath string, typeName string) *TypeSpecDef {
@@ -119,6 +133,37 @@ func (pkgs *PackagesDefinitions) findTypeSpec(pkgPath string, typeName string) *
 			}
 		}
 	}
+	return nil
+}
+
+func (pkgs *PackagesDefinitions) loadExternalPackage(importPath string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	conf := loader.Config{
+		ParserMode: goparser.SpuriousErrors,
+		Cwd:        cwd,
+	}
+
+	conf.Import(importPath)
+
+	lprog, err := conf.Load()
+	if err != nil {
+		return err
+	}
+
+	for _, info := range lprog.AllPackages {
+		pkgPath := info.Pkg.Path()
+		if strings.HasPrefix(pkgPath, "vendor/") {
+			pkgPath = pkgPath[7:]
+		}
+		for _, astFile := range info.Files {
+			pkgs.parseTypesFromFile(astFile, pkgPath, nil)
+		}
+	}
+
 	return nil
 }
 
@@ -174,6 +219,43 @@ func (pkgs *PackagesDefinitions) findPackagePathFromImports(pkg string, file *as
 	return ""
 }
 
+// findPackagePathFromImportsFuzzily finds out fuzzily the package path of a package via ranging imports of a ast.File
+// @pkg the name of the target package
+// @file current ast.File in which to search imports
+// @return the package path of a package of @pkg
+func (pkgs *PackagesDefinitions) findPackagePathFromImportsFuzzily(pkg string, file *ast.File) string {
+	if file == nil {
+		return ""
+	}
+
+	if strings.ContainsRune(pkg, '.') {
+		pkg = strings.Split(pkg, ".")[0]
+	}
+
+	for _, imp := range file.Imports {
+		if imp.Name != nil {
+			continue
+		}
+		pkgPath := strings.Trim(imp.Path.Value, `"`)
+		paths := strings.Split(pkgPath, "/")
+		if paths[len(paths)-1] == pkg {
+			return pkgPath
+		}
+	}
+
+	for _, imp := range file.Imports {
+		if imp.Name != nil && imp.Name.Name == "_" {
+			pkgPath := strings.Trim(imp.Path.Value, `"`)
+			paths := strings.Split(pkgPath, "/")
+			if paths[len(paths)-1] == pkg {
+				return pkgPath
+			}
+		}
+	}
+
+	return ""
+}
+
 // FindTypeSpec finds out TypeSpecDef of a type by typeName
 // @typeName the name of the target type, if it starts with a package name, find its own package path from imports on top of @file
 // @file the ast.file in which @typeName is used
@@ -207,8 +289,14 @@ func (pkgs *PackagesDefinitions) FindTypeSpec(typeName string, file *ast.File) *
 		}
 
 		pkgPath := pkgs.findPackagePathFromImports(parts[0], file)
-		if len(pkgPath) == 0 && parts[0] == file.Name.Name {
-			pkgPath = pkgs.files[file].PackagePath
+		if len(pkgPath) == 0 {
+			if parts[0] == file.Name.Name {
+				pkgPath = pkgs.files[file].PackagePath
+			} else if pkgPath = pkgs.findPackagePathFromImportsFuzzily(parts[0], file); len(pkgPath) > 0 {
+				if err := pkgs.loadExternalPackage(pkgPath); err != nil {
+					return nil
+				}
+			}
 		}
 		return pkgs.findTypeSpec(pkgPath, parts[1])
 	}
